@@ -47,6 +47,93 @@ A Python application that demonstrates AI agent capabilities with a user and CGM
      OPENAI_API_KEY=your_openai_api_key_here
      ```
 
+## Local Development Setup
+
+### Prerequisites
+- Python 3.8 or higher
+- [Git](https://git-scm.com/)
+- [uv](https://github.com/astral-sh/uv) (recommended) or pip
+- [OpenAI API key](https://platform.openai.com/api-keys)
+
+### Step-by-Step Setup
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/aduro-ai-demo.git
+   cd aduro-ai-demo
+   ```
+
+2. **Set up a virtual environment** (recommended)
+   ```bash
+   # Create a virtual environment
+   python -m venv venv
+   
+   # Activate the virtual environment
+   # On macOS/Linux:
+   source venv/bin/activate
+   # On Windows:
+   # venv\Scripts\activate
+   ```
+
+3. **Install dependencies**
+   Using uv (recommended):
+   ```bash
+   uv pip install -r requirements.txt
+   ```
+   
+   Or using pip:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Set up environment variables**
+   ```bash
+   # Copy the example environment file
+   cp .env.example .env
+   ```
+   
+   Edit the `.env` file and add your OpenAI API key:
+   ```
+   OPENAI_API_KEY=your_openai_api_key_here
+   ```
+
+5. **Initialize the database**
+   ```bash
+   # Create the database directory if it doesn't exist
+   mkdir -p db
+   
+   # Run the database initialization
+   python -c "from main import ensure_database; import asyncio; asyncio.run(ensure_database())"
+   ```
+
+6. **Run the application**
+   ```bash
+   python main.py
+   ```
+
+### First Run
+
+1. When you first run the application, you'll see a main menu with options to:
+   - List existing users
+   - Create a new user
+   - Start a chat session
+
+2. **Creating a new user**:
+   - Select option 2 from the main menu
+   - Follow the prompts to enter user details
+   - The system will create a new user and display their ID
+
+3. **Starting a chat session**:
+   - Select option 3 from the main menu
+   - Enter the user ID when prompted
+   - You can now interact with the AI assistant
+
+### Development Tips
+
+- **Command History**: The application saves your command history in `~/.aduro_ai_history`
+- **Database Location**: The SQLite database is stored at `db/users.db`
+- **Logs**: Check the console for any error messages or logs
+
 ## Database Setup
 
 The application uses SQLite for data storage. To set up the database:
