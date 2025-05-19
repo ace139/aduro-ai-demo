@@ -14,6 +14,19 @@ from agents import Agent, function_tool
 MAX_RETRIES = 2
 READING_PATTERN = r'^\d{1,3}(\s*,\s*\d{1,3})*$'
 
+@function_tool
+async def insert_cgm_reading(
+    user_id: int,
+    reading: float,
+    reading_type: str = "fingerstick",
+    timestamp: Optional[datetime] = None
+) -> str:
+    """
+    Inserts one CGM reading into the cgm_readings table.
+    """
+    ts = timestamp or datetime.now()
+    return f"Successfully stored reading of {reading} mg/dL for user #{user_id} at {ts}"
+
 class CGMCollector(Agent):
     """Agent for collecting and storing CGM readings."""
     
@@ -26,34 +39,9 @@ class CGMCollector(Agent):
         super().__init__(
             name="cgm_collector",
             instructions=instructions,
-            tools=[self.insert_cgm_reading]
+            tools=[insert_cgm_reading]
         )
         self.retry_count = 0
-
-    @function_tool
-    async def insert_cgm_reading(
-        self, 
-        user_id: int, 
-        reading: float, 
-        reading_type: str = "fingerstick", 
-        timestamp: Optional[datetime] = None
-    ) -> str:
-        """
-        Inserts one CGM reading into the cgm_readings table.
-        
-        Args:
-            user_id: The ID of the user
-            reading: The blood glucose reading in mg/dL
-            reading_type: Type of reading (default: "fingerstick")
-            timestamp: When the reading was taken (default: current time)
-            
-        Returns:
-            Confirmation message
-        """
-        # In a real implementation, this would connect to a database
-        # For now, we'll just return a success message
-        ts = timestamp or datetime.now()
-        return f"Successfully stored reading of {reading} mg/dL for user #{user_id} at {ts}"
 
     async def process_input(
         self, 
@@ -103,7 +91,7 @@ class CGMCollector(Agent):
         
         # Store each reading
         for reading in readings:
-            await self.insert_cgm_reading(
+            await insert_cgm_reading(
                 user_id=user_id,
                 reading=reading,
                 reading_type="fingerstick",
