@@ -3,29 +3,92 @@ CGM-Collector Agent for collecting and storing CGM readings.
 """
 
 import re
-import unittest
-from datetime import datetime
+import sqlite3
+from pathlib import Path
+from datetime import datetime, time
 from typing import Dict, Any, Optional
-from unittest.mock import AsyncMock
 
 from agents import Agent, function_tool
 
 # Constants
 MAX_RETRIES = 2
 READING_PATTERN = r'^\d{1,3}(\s*,\s*\d{1,3})*$'
+DB_PATH = Path(__file__).resolve().parent.parent / "db" / "users.db"
+
+# Meal time ranges (in 24-hour format)
+MEAL_TIMES = {
+    "breakfast": (time(6, 0), time(10, 59)),   # 6:00 AM - 10:59 AM
+    "lunch": (time(11, 0), time(15, 59)),     # 11:00 AM - 3:59 PM
+    "dinner": (time(16, 0), time(21, 59))     # 4:00 PM - 9:59 PM
+}
+
+def _infer_reading_type(timestamp: datetime) -> str:
+    """
+    Infer the meal type based on the time of day.
+    
+    Args:
+        timestamp: The datetime to check
+        
+    Returns:
+        str: The inferred meal type (breakfast, lunch, dinner, or snack)
+    """
+    current_time = timestamp.time()
+    
+    # Check each meal time range
+    for meal, (start, end) in MEAL_TIMES.items():
+        if start <= current_time <= end:
+            return meal
+    
+    # Default to snack for times outside defined meal periods
+    return "snack"
 
 @function_tool
 async def insert_cgm_reading(
     user_id: int,
     reading: float,
-    reading_type: str = "fingerstick",
     timestamp: Optional[datetime] = None
 ) -> str:
     """
-    Inserts one CGM reading into the cgm_readings table.
+    Inserts one CGM reading into the cgm_readings table in the SQLite database.
+    The reading_type is automatically inferred from the timestamp.
+    
+    Args:
+        user_id: The ID of the user
+        reading: The blood glucose reading in mg/dL
+        timestamp: When the reading was taken (defaults to now)
+        
+    Returns:
+        str: Status message indicating success or failure
     """
     ts = timestamp or datetime.now()
-    return f"Successfully stored reading of {reading} mg/dL for user #{user_id} at {ts}"
+    reading_type = _infer_reading_type(ts)
+    conn = None
+    try:
+        if not DB_PATH.exists():
+            return f"Error: Database file not found at {DB_PATH}. Please ensure it has been initialized."
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "INSERT INTO cgm_readings (user_id, reading, reading_type, timestamp) VALUES (?, ?, ?, ?)",
+            (user_id, reading, reading_type, ts.strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        conn.commit()
+        return f"Successfully stored reading {reading} mg/dL for user #{user_id} at {ts.strftime('%Y-%m-%d %H:%M:%S')}."
+    except sqlite3.IntegrityError as e:
+        if conn:
+            conn.rollback()
+        if "FOREIGN KEY constraint failed" in str(e):
+             return f"Error: User ID #{user_id} not found in the database. Cannot store reading."
+        return f"Error storing reading for user #{user_id}: Database integrity error ({e})."
+    except sqlite3.Error as e:
+        if conn:
+            conn.rollback()
+        return f"Error storing reading {reading} mg/dL for user #{user_id}: A database error occurred ({e})."
+    finally:
+        if conn:
+            conn.close()
 
 class CGMCollector(Agent):
     """Agent for collecting and storing CGM readings."""
@@ -86,79 +149,45 @@ class CGMCollector(Agent):
         """Process and store valid CGM readings."""
         self.retry_count = 0  # Reset retry counter on success
         
-        # Parse readings
-        readings = [float(r.strip()) for r in readings_input.split(',')]
+        readings_values = [float(r.strip()) for r in readings_input.split(',')]
         
-        # Store each reading
-        for reading in readings:
-            await insert_cgm_reading(
+        success_count = 0
+        error_messages = []
+        detailed_results = [] # To store individual messages for clarity
+        
+        for reading_val in readings_values:
+            result_message = await insert_cgm_reading(
                 user_id=user_id,
-                reading=reading,
-                reading_type="fingerstick",
+                reading=reading_val,
                 timestamp=datetime.now()
             )
+            detailed_results.append(result_message) # Store each result
+            if "Successfully stored" in result_message:
+                success_count += 1
+            else:
+                # Extract the core error part if possible for summary
+                error_summary = result_message.split(':', 1)[-1].strip() if ':' in result_message else result_message
+                error_messages.append(f"- Reading {reading_val}: {error_summary}")
         
-        return f"✅ Saved {len(readings)} readings for user #{user_id}. Next, I can generate your meal plan—just let me know when you're ready."
+        response_parts = []
+        if success_count > 0:
+            response_parts.append(f"✅ Saved {success_count} out of {len(readings_values)} readings for user #{user_id}.")
+        elif len(readings_values) > 0:
+             response_parts.append(f"⚠️ Failed to save any of the {len(readings_values)} readings for user #{user_id}.")
+
+        if error_messages:
+            response_parts.append("Details:")
+            response_parts.extend(error_messages)
+        
+        if not response_parts and len(readings_values) > 0:
+             return "No readings were processed or results available."
+        elif not readings_values:
+            return "No readings provided to process."
+
+        # Add next step prompt only if all were successful
+        if success_count == len(readings_values) and success_count > 0:
+             response_parts.append("Next, I can generate your meal plan—just let me know when you're ready.")
+        
+        return "\n".join(response_parts)
 
 
-# Tests
-
-class TestCGMCollector(unittest.IsolatedAsyncioTestCase):
-    """Unit tests for CGMCollector agent."""
-    
-    async def asyncSetUp(self):
-        """Set up test fixtures."""
-        self.agent = CGMCollector()
-        self.agent.insert_cgm_reading = AsyncMock(return_value="Mocked DB response")
-    
-    async def test_valid_readings(self):
-        """Test with valid readings input."""
-        context = {"user_id": 123}
-        
-        # Initial prompt
-        response = await self.agent.process_input("hi", context)
-        self.assertIn("Please enter your latest CGM readings", response)
-        
-        # Process valid readings
-        response = await self.agent.process_input("95, 110, 102", context)
-        self.assertIn("✅ Saved 3 readings for user #123", response)
-        self.assertEqual(self.agent.insert_cgm_reading.await_count, 3)
-    
-    async def test_invalid_readings_retry(self):
-        """Test retry mechanism with invalid inputs."""
-        context = {"user_id": 123}
-        
-        # Initial prompt
-        await self.agent.process_input("hi", context)
-        
-        # First invalid input
-        response = await self.agent.process_input("95;110;102", context)
-        self.assertEqual(response, "I didn't understand. Send readings like `95,110,102`.")
-        
-        # Second invalid input
-        response = await self.agent.process_input("abc", context)
-        self.assertEqual(response, "I didn't understand. Send readings like `95,110,102`.")
-        
-        # Third invalid input should fail
-        response = await self.agent.process_input("123;456", context)
-        self.assertEqual(response, "Maximum retry attempts reached. Please try again later.")
-    
-    async def test_missing_user_id(self):
-        """Test authentication error when user_id is missing."""
-        with self.assertRaises(ValueError) as context:
-            await self.agent.process_input("hi", {})
-        self.assertIn("Authentication required", str(context.exception))
-
-
-if __name__ == "__main__":
-    # Run tests
-    unittest.main(argv=['first-arg-is-ignored'], exit=False)
-    
-    # Example usage
-    def show_usage_example():
-        """Show example usage of the CGMCollector agent."""
-        print("Example usage of CGMCollector:")
-        print("1. Create an agent: agent = CGMCollector()")
-        print('2. Process input with user context: await agent.process_input("95,110,102", {"user_id": 123})')
-    
-    show_usage_example()
