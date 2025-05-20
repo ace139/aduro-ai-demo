@@ -8,110 +8,105 @@ This module provides the GreeterProfiler agent which is responsible for:
 - Updating user profiles in the database
 """
 
-from typing import Dict, List, Any
-import sqlite3
-from pathlib import Path
+from typing import Any
 
 from agents import Agent, function_tool
 
-# Constants
-DB_PATH = Path("db/users.db")
+from aduro_agents.models import UserProfile
+from aduro_agents.utils.database import DatabaseManager
 
-async def _update_user_profile(user_id: int, updates: Dict[str, Any], test_conn=None) -> bool:
+
+async def _update_user_profile(
+    user_id: int, updates: dict[str, Any], db_manager: DatabaseManager | None = None
+) -> bool:
     """
     Update user profile in the database.
-    
+
     Args:
         user_id: The ID of the user
         updates: Dictionary of fields to update
-        test_conn: Optional database connection for testing
-        
+        db_manager: Optional DatabaseManager instance for testing
+
     Returns:
         bool: True if update was successful, False otherwise
     """
     if not updates:
         return False
-        
-    close_conn = False
-    if test_conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        close_conn = True
-    else:
-        conn = test_conn
-    
+
+    # Use provided db_manager or create a new one
+    close_db = False
+    if db_manager is None:
+        db_manager = DatabaseManager()
+        close_db = True
+
     try:
-        cursor = conn.cursor()
-        
         # Build the SET clause dynamically based on provided updates
         set_clause = ", ".join(f"{field} = ?" for field in updates.keys())
         values = list(updates.values())
         values.append(user_id)  # For the WHERE clause
-        
+
         query = f"""
-            UPDATE users 
+            UPDATE users
             SET {set_clause}
             WHERE id = ?
         """
-        
-        cursor.execute(query, values)
-        conn.commit()
-        return cursor.rowcount > 0
+
+        success = await db_manager.execute_query(query, values, commit=True)
+        return success
+
     except Exception as e:
-        print(f"Error updating user profile: {e}")
-        if close_conn:
-            conn.rollback()
+        print(f"Database error: {e}")
         return False
     finally:
-        if close_conn:
-            conn.close()
+        if close_db and db_manager:
+            await db_manager.close()
 
-async def _get_user_profile_from_db(user_id: int, test_conn=None) -> Dict[str, Any]:
+
+async def _get_user_profile_from_db(
+    user_id: int, db_manager: DatabaseManager | None = None
+) -> UserProfile | None:
     """
     Internal function to fetch user profile from the database.
-    
+
     Args:
         user_id: The ID of the user
-        test_conn: Optional database connection for testing
-        
+        db_manager: Optional DatabaseManager instance for testing
+
     Returns:
-        Dictionary containing user profile information.
+        Dictionary containing user profile information or None if not found
     """
-    close_conn = False
-    if test_conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        close_conn = True
-    else:
-        conn = test_conn
-        
-    conn.row_factory = sqlite3.Row
+    close_db = False
+    if db_manager is None:
+        db_manager = DatabaseManager()
+        close_db = True
+
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
+        query = """
             SELECT first_name, last_name, city, email, date_of_birth,
                    dietary_preference, medical_conditions, physical_limitations
-            FROM users 
+            FROM users
             WHERE id = ?
-        """, (user_id,))
-        
-        result = cursor.fetchone()
-        if not result:
-            return {}
-            
-        # Convert to dict and handle None values
-        profile = {k: v for k, v in dict(result).items() if v is not None}
-        return profile
+        """
+
+        result = await db_manager.fetch_one(query, (user_id,))
+        return UserProfile(**dict(result)) if result else None
+
+    except Exception as e:
+        print(f"Database error: {e}")
+        return None
     finally:
-        if close_conn:
-            conn.close()
+        if close_db and db_manager:
+            await db_manager.close()
+
 
 @function_tool
-async def get_user_profile(user_id: int) -> Dict[str, Any]:
+async def get_user_profile(user_id: int) -> UserProfile:
     """
     Fetches the user profile from the database.
-    
+
     Args:
         user_id: The ID of the user
-        
+
     Returns:
         Dictionary containing user profile information with the following fields:
         {
@@ -125,140 +120,106 @@ async def get_user_profile(user_id: int) -> Dict[str, Any]:
             "physical_limitations": str or None
         }
     """
-    return await _get_user_profile_from_db(user_id)
+    profile = await _get_user_profile_from_db(user_id)
+    return profile if profile else UserProfile()
 
-def get_missing_fields(profile: Dict[str, Any]) -> List[str]:
+
+@function_tool
+def get_missing_fields(profile: UserProfile) -> list[str]:
     """
     Identifies which required fields are missing from the user profile.
-    
+
     Args:
         profile: Dictionary containing user profile data
-        
+
     Returns:
         List of missing required field names
     """
-    REQUIRED_FIELDS = [
-        "first_name", "last_name", "city", 
-        "email", "date_of_birth", "dietary_preference"
+    required_fields = [
+        "first_name",
+        "last_name",
+        "city",
+        "email",
+        "date_of_birth",
+        "dietary_preference",
     ]
-    return [field for field in REQUIRED_FIELDS if not profile.get(field) or profile[field] == '']
+    return [
+        field
+        for field in required_fields
+        if not getattr(profile, field, None) or getattr(profile, field) == ""
+    ]
+
 
 class GreeterProfiler(Agent):
     """Agent responsible for greeting users and collecting profile information."""
-    
+
     def __init__(self):
         super().__init__(
             name="greeter_profiler",
             instructions="""
-            You are a friendly assistant that helps collect user profile information.
-            Greet the user warmly and guide them through providing any missing details.
-            Be polite, concise, and professional in your interactions.
+            You are a friendly AI assistant responsible for greeting users and ensuring their profile information is complete. Your primary goal is to collect any missing required profile details.
+
+            Follow these steps:
+            1. Greet the user warmly and professionally.
+            2. Use the 'get_user_profile' tool to fetch the user's current profile information using their user_id (available in the context).
+            3. Use the 'get_missing_fields' tool, passing the profile data obtained from 'get_user_profile', to identify any required fields that are missing or empty.
+            4. If there are missing fields:
+                - Inform the user which fields are missing.
+                - Politely ask the user to provide the information for these missing fields, one or two at a time to avoid overwhelming them.
+                - Be conversational. For example, instead of just saying 'Missing: first_name', say 'I see we're missing your first name. Could you please provide it?'
+            5. If the 'get_missing_fields' tool returns an empty list (meaning no required fields are missing):
+                - Inform the user that their profile looks complete or up-to-date.
+                - You can end with a positive note, for example, 'Thanks! Your profile is all set up.'
+
+            Always be polite, concise, and helpful throughout the interaction.
+            The required fields this system tracks are: first_name, last_name, city, email, date_of_birth, dietary_preference.
             """,
-            tools=[get_user_profile]
+            model="gpt-4.1-mini",
+            tools=[
+                get_user_profile,
+                get_missing_fields,
+            ],  # Added get_missing_fields tool
+            handoff_description="Specialist for greeting new users and collecting initial profile information.",
         )
-        self._greeted_users = set()
+        self._greeted_users = set()  # This set is for internal Python logic if ever needed, not directly for LLM use without a tool.
 
     async def process_input(
-        self, 
-        user_input: str, 
-        context: Dict[str, Any], 
-        test_conn=None
+        self,
+        user_input: str,  # This is the 'message' for self.run
+        context: dict[str, Any],
+        db_manager: DatabaseManager
+        | None = None,  # Kept for compatibility, not used directly
+        test_conn=None,  # Kept for backward compatibility, not used directly
     ) -> str:
         """
-        Process user input and return a response.
-        
+        Process user input using the agent's SDK capabilities.
+
         Args:
-            user_input: The user's input text
-            context: Dictionary containing additional context (e.g., user_id)
-            test_conn: Optional database connection for testing
-            
+            user_input: The user's input text (message for the agent).
+            context: Dictionary containing additional context (must include 'user_id').
+            db_manager: Optional DatabaseManager instance (kept for test compatibility).
+
         Returns:
-            str: The agent's response
+            str: The agent's response.
+
+        Raises:
+            ValueError: If user_id is missing from the context.
         """
         user_id = context.get("user_id")
-        if not isinstance(user_id, int) or user_id <= 0:
-            return "⚠️ Missing or invalid user ID. Please re-authenticate."
-        
-        # Get user profile
-        try:
-            # Use the internal function to get the profile
-            profile = await _get_user_profile_from_db(user_id, test_conn=test_conn)
-            if not isinstance(profile, dict):
-                profile = {}
-        except Exception as e:
-            print(f"Error getting user profile: {e}")
-            profile = {}
-        
-        # Check if this is the first interaction
-        is_first_interaction = user_id not in self._greeted_users
-        
-        if is_first_interaction:
-            self._greeted_users.add(user_id)
-            greeting = f"Hello {profile.get('first_name', 'there')}! 👋 I'm here to help you get started with your personalized health assistant. "
-        else:
-            greeting = ""
-        
-        # Check if the user is providing information
-        if user_input and user_input.strip() and user_input.lower() not in ["hi", "hello", "hey"]:
-            # Try to determine what field this might be
-            missing_fields = get_missing_fields(profile)
-            if missing_fields:
-                field = missing_fields[0]
-                
-                # Map the input to a field value
-                updates = {}
-                if field == "dietary_preference":
-                    pref = user_input.strip().lower()
-                    if pref in ["vegetarian", "non-vegetarian", "vegan"]:
-                        updates["dietary_preference"] = pref
-                elif field == "first_name":
-                    updates["first_name"] = user_input.strip()
-                elif field == "last_name":
-                    updates["last_name"] = user_input.strip()
-                elif field == "email" and "@" in user_input:
-                    updates["email"] = user_input.strip()
-                elif field == "date_of_birth" and "-" in user_input:
-                    updates["date_of_birth"] = user_input.strip()
-                elif field == "city":
-                    updates["city"] = user_input.strip()
-                
-                # Save the updates if any
-                if updates:
-                    success = await _update_user_profile(user_id, updates, test_conn=test_conn)
-                    if success:
-                        # Refresh the profile
-                        profile = await _get_user_profile_from_db(user_id, test_conn=test_conn)
-                        
-        # Check for missing required fields
-        missing_fields = get_missing_fields(profile)
-        if missing_fields:
-            if is_first_interaction:
-                response = greeting + "I'll need just a few details to create a custom diet and CGM-based plan for you. Let's get started. "
-            else:
-                response = "Thanks! I'll update your profile with that information. "
-                
-            # Ask for the first missing field
-            field = missing_fields[0]
-            if field == "first_name":
-                response += "What's your first name?"
-            elif field == "last_name":
-                response += "What's your last name?"
-            elif field == "email":
-                response += "What's your email address?"
-            elif field == "date_of_birth":
-                response += "What's your date of birth? (YYYY-MM-DD)"
-            elif field == "dietary_preference":
-                response += "What's your dietary preference? (vegetarian / non-vegetarian / vegan)"
-            else:
-                # For any other fields, use a generic prompt
-                field_name = field.replace("_", " ")
-                response += f"What's your {field_name}?"
-                
-            return response
-        
-        # If we get here, the profile is complete
-        if is_first_interaction:
-            return greeting + "🎉 Your profile is complete. You're all set! Let me know if you'd like to update anything."
-        else:
-            return "🎉 Your profile is complete. You're all set! Let me know if you'd like to update anything."
+        if not user_id or not isinstance(user_id, int):
+            # For direct calls, this check is useful.
+            # If invoked via SDK handoff, TriageAgent/SDK might handle context validation.
+            raise ValueError("Authentication required. Please provide a valid user_id.")
 
+        try:
+            # The agent's instructions and tools (like get_user_profile)
+            # will now handle profile checking, greeting, and prompting for info.
+            run_context = {"user_id": user_id}
+            # If other parts of the incoming 'context' from tests/direct calls are relevant
+            # to the agent's operation as per its instructions, they should be added to 'run_context'.
+
+            agent_response = await self.run(message=user_input, context=run_context)
+            return str(agent_response.final_output)
+        except Exception as e:
+            # Consider adding logging here: import logging; logger = logging.getLogger(__name__); logger.error(f"Error: {e!s}")
+            return f"Sorry, I encountered an issue while processing your request in GreeterProfiler: {e!s}"

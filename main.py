@@ -1,360 +1,319 @@
 #!/usr/bin/env python3
 
 """
-Interactive Terminal Chat for Aduro AI Health Assistant
+Aduro AI Health Assistant - Main Entry Point
 
-This script provides an interactive terminal interface to chat with the
-Aduro AI Health Assistant, which coordinates between different specialized agents
-to handle user profile management, CGM readings, and meal planning.
+This script provides a command-line interface for the Aduro AI Health Assistant,
+which uses a TriageAgent to route requests to specialized agents for different
+health-related tasks.
 """
 
+import argparse
 import asyncio
-import atexit
 import os
 import readline
-import sqlite3
-import sys
 from datetime import datetime
-from pathlib import Path
+from typing import Any
 
-from dotenv import load_dotenv
+from agents import RunContextWrapper, Runner
 
-# Import agents after setting up sys.path
-sys.path.insert(0, os.path.abspath('./agents'))
-from aduro_agents.orchestrator import Orchestrator
+from aduro_agents.models import AduroConversationContext, ProfileStatus
+from aduro_agents.triage_agent import TriageAgent
 
 # Set up command history file
 HISTORY_FILE = os.path.expanduser('~/.aduro_ai_history')
 
-def init_readline():
+
+def init_readline() -> None:
     """Initialize readline with tab completion and history."""
     # Enable tab completion
     readline.parse_and_bind('tab: complete')
-    
+
     # Set up history file
     try:
         readline.read_history_file(HISTORY_FILE)
-        # Set history length to 1000 lines
         readline.set_history_length(1000)
     except FileNotFoundError:
         open(HISTORY_FILE, 'a').close()
-    
+
     # Save history on exit
+    import atexit
     atexit.register(readline.write_history_file, HISTORY_FILE)
 
-# Initialize readline
-init_readline()
 
-# Database path
-DB_PATH = Path("db/users.db")
-
-# ANSI color codes for terminal output
-COLORS = {
-    "RESET": "\033[0m",
-    "BOLD": "\033[1m",
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "MAGENTA": "\033[95m",
-    "CYAN": "\033[96m",
-}
+def print_welcome() -> None:
+    """Print the welcome message and usage instructions."""
+    print("\n" + "=" * 70)
+    print("Aduro AI Health Assistant".center(70))
+    print("=" * 70)
+    print("\nI can help you with:")
+    print("  • Setting up your health profile")
+    print("  • Recording and analyzing CGM readings")
+    print("  • Creating personalized meal plans")
+    print("  • Updating your profile information")
+    print("\nType 'exit' or 'quit' to end the session")
+    print("-" * 70 + "\n")
 
 
-async def ensure_database():
-    """Ensure the database exists and has necessary tables."""
-    # Create db directory if it doesn't exist
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    
-    # Connect to the database
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Create users table if it doesn't exist
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        first_name TEXT,
-        last_name TEXT,
-        city TEXT,
-        email TEXT UNIQUE,
-        date_of_birth DATE,
-        dietary_preference TEXT CHECK(dietary_preference IN ('vegetarian', 'non-vegetarian', 'vegan')),
-        medical_conditions TEXT,
-        physical_limitations TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+def create_initial_context(user_id: int | None = None, debug: bool = False) -> dict[str, Any]:
+    """
+    Create the initial context dictionary for the conversation.
+
+    Args:
+        user_id: Optional user ID to use for the session
+        debug: Whether to enable debug output
+
+    Returns:
+        A dictionary containing the initial context
+    """
+    from uuid import uuid4
+
+    # Create a new conversation context
+    conversation_context = AduroConversationContext(
+        user_id=user_id or 1,  # Default to user 1 if not specified
+        profile_status=ProfileStatus.NOT_STARTED,
+        has_cgm_data=False,
+        last_interaction=datetime.utcnow()
     )
-    """)
-    
-    # Create CGM readings table if it doesn't exist
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS cgm_readings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        reading REAL,
-        reading_type TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )
-    """)
-    
-    # Commit changes and close connection
-    conn.commit()
-    conn.close()
+
+    return {
+        # User identification
+        'user_id': user_id or 1,  # Default to user 1 if not specified
+        'session_id': str(uuid4()),
+
+        # System settings
+        'debug': debug,
+        'start_time': datetime.now().isoformat(),
+
+        # Conversation state
+        'message_count': 0,
+        'last_message': None,
+        'conversation_history': [],
+
+        # Conversation context
+        'conversation_context': conversation_context,
+
+        # User context (will be populated during the conversation)
+        'user_context': {
+            'profile_complete': False,
+            'cgm_connected': False,
+            'preferences': {}
+        }
+    }
 
 
-async def ensure_test_user():
-    """Ensure a test user exists in the database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Check if test user exists
-    cursor.execute("SELECT id FROM users WHERE id = 1")
-    if not cursor.fetchone():
-        # Create a test user
-        cursor.execute("""
-        INSERT INTO users (id, first_name, email)
-        VALUES (1, 'Test', 'test@example.com')
-        """)
-        print(f"{COLORS['GREEN']}Created test user with ID 1{COLORS['RESET']}")
-    
-    # Commit changes and close connection
-    conn.commit()
-    conn.close()
-    return 1  # Return the test user ID
+async def run_conversation(user_id: int | None = None, debug: bool = False) -> None:
+    """
+    Run the main conversation loop with the TriageAgent.
 
+    This function initializes the TriageAgent and enters a loop that:
+    1. Takes natural language input from the user
+    2. Processes it through the TriageAgent
+    3. Displays the response
+    4. Maintains conversation context
 
-async def list_users():
-    """List all users in the database."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Get all users
-    cursor.execute("SELECT id, first_name, last_name, email FROM users")
-    users = cursor.fetchall()
-    
-    # Close connection
-    conn.close()
-    
-    if not users:
-        print(f"{COLORS['YELLOW']}No users found.{COLORS['RESET']}")
-        return
-    
-    # Print users
-    print(f"\n{COLORS['BOLD']}Available Users:{COLORS['RESET']}")
-    print("-" * 50)
-    for user in users:
-        print(f"ID: {user['id']}, Name: {user['first_name']} {user['last_name'] or ''}, Email: {user['email'] or ''}")
-    print("-" * 50)
+    Args:
+        user_id: Optional user ID to use for the session
+        debug: Whether to enable debug output
+    """
+    print("Initializing Aduro AI Health Assistant...")
 
-
-async def create_new_user():
-    """Create a new user in the database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Get user information
-    print(f"\n{COLORS['BOLD']}Create a New User:{COLORS['RESET']}")
-    first_name = input("First Name: ")
-    email = input("Email: ")
-    
-    # Insert user
-    cursor.execute("""
-    INSERT INTO users (first_name, email, created_at)
-    VALUES (?, ?, ?)
-    """, (first_name, email, datetime.datetime.now()))
-    
-    # Get the new user's ID
-    user_id = cursor.lastrowid
-    
-    # Commit changes and close connection
-    conn.commit()
-    conn.close()
-    
-    print(f"{COLORS['GREEN']}Created new user with ID {user_id}{COLORS['RESET']}")
-    return user_id
-
-
-async def check_user_profile(user_id):
-    """Check if user has a complete profile."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Get user profile
-    cursor.execute("""
-    SELECT first_name, last_name, city, email, date_of_birth, dietary_preference
-    FROM users
-    WHERE id = ?
-    """, (user_id,))
-    
-    profile = cursor.fetchone()
-    conn.close()
-    
-    if not profile:
-        return False, {}
-    
-    # Convert to dict
-    profile_dict = dict(profile)
-    
-    # Check required fields
-    required_fields = ["first_name", "last_name", "city", "email", "date_of_birth", "dietary_preference"]
-    complete = all(profile_dict.get(field) for field in required_fields)
-    
-    return complete, profile_dict
-
-
-async def check_user_cgm(user_id):
-    """Check if user has CGM readings."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Get CGM readings count
-    cursor.execute("""
-    SELECT COUNT(*) FROM cgm_readings WHERE user_id = ?
-    """, (user_id,))
-    
-    count = cursor.fetchone()[0]
-    conn.close()
-    
-    return count > 0
-
-
-async def print_user_status(user_id):
-    """Print user status information."""
-    complete, profile = await check_user_profile(user_id)
-    has_cgm = await check_user_cgm(user_id)
-    
-    print(f"\n{COLORS['BOLD']}User Status:{COLORS['RESET']}")
-    print("-" * 50)
-    print(f"User ID: {user_id}")
-    print(f"Profile Complete: {'✅' if complete else '❌'}")
-    print(f"CGM Readings: {'✅' if has_cgm else '❌'}")
-    
-    if profile:
-        print(f"\n{COLORS['BOLD']}Profile Information:{COLORS['RESET']}")
-        for key, value in profile.items():
-            if value:  # Only show non-empty fields
-                print(f"{key.replace('_', ' ').title()}: {value}")
-    
-    print("-" * 50)
-
-
-async def chat_session(orchestrator, user_id):
-    """Start an interactive chat session with the agent."""
-    # Initialize the context with user_id
-    context = {"user_id": user_id}
-    
-    # Check if profile is complete
-    profile_complete, _ = await check_user_profile(user_id)
-    context["profile_complete"] = profile_complete
-    
-    # Check if CGM readings are available
-    cgm_collected = await check_user_cgm(user_id)
-    context["cgm_collected"] = cgm_collected
-    
-    print(f"\n{COLORS['CYAN']}Starting chat with Aduro AI Health Assistant...{COLORS['RESET']}")
-    print(f"{COLORS['CYAN']}Type 'exit', 'quit', or 'bye' to end the session.{COLORS['RESET']}")
-    print(f"{COLORS['CYAN']}Type 'status' to see your current profile status.{COLORS['RESET']}")
-    print("-" * 50)
-    
-    # Send a greeting to the orchestrator
-    response = await orchestrator.handle_message("Hello", context)
-    print(f"\n{COLORS['GREEN']}AI: {response}{COLORS['RESET']}")
-    
-    # Start the conversation loop
-    while True:
-        # Get user input
-        try:
-            user_input = input(f"\n{COLORS['BLUE']}You: {COLORS['RESET']}")
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting chat session...")
-            break
-        
-        # Check for exit commands
-        if user_input.lower() in ["exit", "quit", "bye"]:
-            print("Exiting chat session...")
-            break
-        
-        # Check for status command
-        if user_input.lower() == "status":
-            await print_user_status(user_id)
-            continue
-        
-        # Get response from the orchestrator
-        try:
-            response = await orchestrator.handle_message(user_input, context)
-            print(f"\n{COLORS['GREEN']}AI: {response}{COLORS['RESET']}")
-        except Exception as e:
-            print(f"\n{COLORS['RED']}Error: {str(e)}{COLORS['RESET']}")
-
-
-async def main_menu():
-    """Display the main menu and handle user selections."""
-    # Create an instance of the orchestrator
-    orchestrator = Orchestrator()
-    
-    while True:
-        print(f"\n{COLORS['BOLD']}Aduro AI Health Assistant{COLORS['RESET']}")
-        print("-" * 50)
-        print("1. Chat with existing user")
-        print("2. Create new user")
-        print("3. List all users")
-        print("4. Quit")
-        print("-" * 50)
-        
-        # Get user selection
-        choice = input("Select an option (1-4): ")
-        
-        if choice == "1":
-            # List users first
-            await list_users()
-            
-            # Get user ID
-            try:
-                user_id = int(input("Enter user ID: "))
-                await print_user_status(user_id)
-                await chat_session(orchestrator, user_id)
-            except ValueError:
-                print(f"{COLORS['RED']}Invalid user ID. Please enter a number.{COLORS['RESET']}")
-        
-        elif choice == "2":
-            user_id = await create_new_user()
-            await chat_session(orchestrator, user_id)
-        
-        elif choice == "3":
-            await list_users()
-        
-        elif choice == "4":
-            print("Goodbye!")
-            break
-        
-        else:
-            print(f"{COLORS['RED']}Invalid selection. Please try again.{COLORS['RESET']}")
-
-
-async def main():
-    """Main entry point for the application."""
     try:
-        # Load environment variables
-        load_dotenv()
-        
-        # Ensure database exists
-        await ensure_database()
-        
-        # Ensure test user exists
-        await ensure_test_user()
-        
-        # Start the main menu
-        await main_menu()
-        
+        # Set up the database path
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'db', 'users.db')
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        # Initialize the agent
+        triage_agent = TriageAgent(db_path=db_path)
+
+        # Set up the initial context
+        context = create_initial_context(user_id, debug)
+
+        # Print welcome message
+        print_welcome()
+
+        # Main conversation loop
+        while True:
+            try:
+                # Get user input
+                try:
+                    user_input = input("\nYou: ").strip()
+
+                    # Update context with user message
+                    context['last_message'] = user_input
+                    context['message_count'] += 1
+                    context['conversation_history'].append({
+                        'role': 'user',
+                        'content': user_input,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                except (EOFError, KeyboardInterrupt):
+                    print("\n\nGoodbye!")
+                    break
+
+                # Check for exit conditions
+                if not user_input:
+                    continue
+
+                if user_input.lower() in ('exit', 'quit', 'bye', 'goodbye'):
+                    print("\nGoodbye! Thanks for using Aduro AI Health Assistant.")
+                    break
+
+                # Process the input through the agent
+                try:
+                    # Create a context wrapper with our context (not used directly but needed for the agent)
+                    _ = RunContextWrapper(context=context)
+
+                    # Run the agent
+                    response = await Runner.run(
+                        triage_agent,
+                        user_input,
+                        context=context
+                    )
+
+                    # Extract the final output
+                    assistant_response = response.final_output
+
+                    # Update the conversation context with the latest interaction
+                    if 'conversation_context' in context:
+                        context['conversation_context'].last_interaction = datetime.utcnow()
+
+                    # Update context with assistant response
+                    context['conversation_history'].append({
+                        'role': 'assistant',
+                        'content': assistant_response,
+                        'timestamp': datetime.now().isoformat(),
+                        'context': context.get('conversation_context').model_dump() if 'conversation_context' in context else {}
+                    })
+
+                    # Print the response with some formatting
+                    print("\n" + "=" * 70)
+
+                    # Add context information to the response if in debug mode
+                    if context.get('debug', False) and 'conversation_context' in context:
+                        ctx = context['conversation_context']
+                        print(f"[DEBUG] Profile Status: {ctx.profile_status.value}")
+                        print(f"[DEBUG] Has CGM Data: {ctx.has_cgm_data}")
+                        print(f"[DEBUG] Last Interaction: {ctx.last_interaction}")
+                        print("-" * 70)
+
+                    print(f"Assistant: {assistant_response}")
+                    print("=" * 70)
+
+                except Exception as e:
+                    error_msg = f"I'm sorry, I encountered an error: {e!s}"
+                    print(f"\n{error_msg}")
+
+                    if debug:
+                        import traceback
+                        print("\nDebug information:")
+                        traceback.print_exc()
+
+                    # Log the error in context
+                    context['conversation_history'].append({
+                        'role': 'system',
+                        'content': f'Error: {e!s}',
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                    # Print the error message to the user
+                    print(f"\nError: {e!s}")
+
+            except Exception as e:
+                error_msg = "An unexpected error occurred. Please try again."
+                print(f"\n{error_msg}")
+                if debug:
+                    import traceback
+                    print(f"Debug: {e!s}")
+                    traceback.print_exc()
+
+                # Log the error in context if context is available
+                if 'conversation_history' in context:
+                    context['conversation_history'].append({
+                        'role': 'system',
+                        'content': f'Unexpected error: {e!s}',
+                        'timestamp': datetime.now().isoformat()
+                    })
+
     except Exception as e:
-        print(f"\n{COLORS['RED']}An error occurred: {str(e)}{COLORS['RESET']}")
-        print("Please make sure you have set up your environment correctly.")
+        print(f"\nFailed to initialize the application: {e!s}")
+        if debug:
+            import traceback
+            traceback.print_exc()
+
+
+async def test_handoff(debug: bool = False) -> None:
+    """Test the handoff functionality from TriageAgent to GreeterProfiler."""
+    print("\n=== Testing Handoff to GreeterProfiler ===\n")
+
+    # Set up the database path
+    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'db', 'users.db')
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+    # Initialize the agent
+    triage_agent = TriageAgent(db_path=db_path)
+
+    # Test message that should trigger GreeterProfiler
+    test_message = "I want to create a new profile"
+    context = {'user_id': 999, 'debug': debug}  # Using a test user ID
+
+    print(f"Sending test message: \"{test_message}\"")
+    print("Expected behavior: This should be handled by the GreeterProfiler agent\n")
+
+    try:
+        # Process the test message using the return_dict parameter to get agent info
+        response = await triage_agent.process_input(test_message, context=context, return_dict=True)
+
+        # Print the response message
+        print(f"\nResponse from agent: {response['message']}")
+
+        # Verify the handoff occurred by checking the agent_name in the response
+        if 'agent_name' in response and 'greeter' in response['agent_name'].lower():
+            print(f"\n✅ Success: Message was correctly handed off to {response['agent_name']}")
+        else:
+            print("\n❌ Warning: Message may not have been handed off to GreeterProfiler")
+            if debug:
+                print(f"Agent that handled the request: {response.get('agent_name', 'Unknown')}")
+
+    except Exception as e:
+        print(f"\n❌ Error during handoff test: {e!s}")
+        if debug:
+            import traceback
+            traceback.print_exc()
+
+    print("\n=== End of Handoff Test ===\n")
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Aduro AI Health Assistant')
+    parser.add_argument('--user-id', type=int, help='User ID to use for the session')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--test-handoff', action='store_true',
+                       help='Run a test of the agent handoff functionality')
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # Run the async main function
-    asyncio.run(main())
+    # Parse command line arguments
+    args = parse_arguments()
+
+    # Initialize readline for better input handling
+    init_readline()
+
+    try:
+        if args.test_handoff:
+            # Run the handoff test
+            asyncio.run(test_handoff(debug=args.debug))
+        else:
+            # Run the main conversation loop
+            asyncio.run(run_conversation(user_id=args.user_id, debug=args.debug))
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
+    except Exception as e:
+        print(f"\nAn error occurred: {e!s}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+        raise
