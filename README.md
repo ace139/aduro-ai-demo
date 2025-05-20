@@ -183,7 +183,67 @@ To run the CGM Collector agent directly:
 python agents/cgm_collector.py
 ```
 
-This will execute the test suite for the CGM Collector agent.
+## Running Tests
+
+### Prerequisites
+
+Install test dependencies:
+
+```bash
+uv pip install -r requirements-test.txt
+```
+
+### Running All Tests
+
+```bash
+pytest -v
+```
+
+### Running Specific Test Flows
+
+1. **First-Time User Flow**:
+   ```bash
+   pytest tests/integration/test_conversation_flows.py::test_flow_first_time_user_complete_profile -v
+   ```
+
+2. **Returning User Needs CGM**:
+   ```bash
+   pytest tests/integration/test_conversation_flows.py::test_flow_returning_user_needs_cgm -v
+   ```
+
+3. **Stale CGM Data**:
+   ```bash
+   pytest tests/integration/test_conversation_flows.py::test_flow_stale_cgm -v
+   ```
+
+### Test Coverage Report
+
+To generate a coverage report:
+
+```bash
+pytest --cov=./ --cov-report=html
+```
+
+Open `htmlcov/index.html` in your browser to view the coverage report.
+
+### Test Implementation Notes
+
+The test suite includes the following key test flows:
+
+1. First-time user completing profile and getting a meal plan
+2. Returning user who needs to provide fresh CGM readings
+3. User with stale CGM data being prompted for new readings
+4. Profile updates mid-session
+5. Handling of invalid dietary preferences
+6. Unauthenticated user handling
+7. Malformed CGM input with retries
+8. Excessive CGM retries leading to abort
+9. Partial profile with user going silent
+10. Concurrent field updates
+11. Duplicate email handling
+12. Large CGM batch processing
+
+Each test is designed to verify both the happy path and error handling scenarios to ensure robust behavior in production.
 
 ## CGM Collector Agent
 

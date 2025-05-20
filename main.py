@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 # Import agents after setting up sys.path
 sys.path.insert(0, os.path.abspath('./agents'))
-from orchestrator import Orchestrator
+from aduro_agents.orchestrator import Orchestrator
 
 # Set up command history file
 HISTORY_FILE = os.path.expanduser('~/.aduro_ai_history')

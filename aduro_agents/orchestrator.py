@@ -9,11 +9,11 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Any
 
-# Use relative imports since we're in the agents package
-from greeter_profiler import GreeterProfiler
-from profile_updater import ProfileUpdater
-from cgm_collector import CGMCollector
-from meal_planner import MealPlanner
+# Import Aduro AI custom agents from the new package
+from aduro_agents.greeter_profiler import GreeterProfiler
+from aduro_agents.profile_updater import ProfileUpdater
+from aduro_agents.cgm_collector import CGMCollector
+from aduro_agents.meal_planner import MealPlanner
 
 # Database constants
 DB_PATH = Path("db/users.db")
